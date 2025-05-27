@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
@@ -9,12 +9,10 @@ class SharableSpreadSheet
     private int rows, cols;
     private int userLimit;
 
-    // Global lock for structural changes (row/col add, save/load)
-    // - Writers: structure-changing ops
-    // - Readers: cell operations (get/set/search)
+
     private ReaderWriterLockSlim globalLock = new ReaderWriterLockSlim(); //global lock for sheet changes, for example, adding a row/column (write), or saving(read) 
 
-    // Partition locks for fine-grained concurrency on cells
+
     private ReaderWriterLockSlim[] userLocks; //partitioned lockes responsible for certain parts of the spreadsheet, they are split 
 
     public SharableSpreadSheet(int nRows, int nCols, int nUsers = -1) //initialising the shareablespreadhseet class.
@@ -93,6 +91,8 @@ class SharableSpreadSheet
             cellLock.EnterReadLock();
             try
             {
+                cellLock.ExitReadLock(); //exiting global and local locks
+                globalLock.ExitReadLock();
                 return data[row, col]; //returning the text
             }
             finally
@@ -136,7 +136,7 @@ class SharableSpreadSheet
     {
         if (row1 < -1 || row1 >= rows) throw new ArgumentOutOfRangeException(); //making sure the indexes are fine, -1 means adding it to the left of 0
 
-        // Acquire exclusive global lock - prevents cell reads/writes during resize
+
         globalLock.EnterWriteLock(); //accessing the global write lock
         try
         {
@@ -193,13 +193,13 @@ class SharableSpreadSheet
         }
     }
 
-    // Row exchange requires multiple cell locks write lock, global lock in read mode to prevent structural changes
-    public void exchangeRows(int row1, int row2)
+
+    public void exchangeRows(int row1, int row2) //exchanging rows, this will need a global read lock and and local write lock
     {
-        ValidateRow(row1);
+        ValidateRow(row1); //validating the 2 rows
         ValidateRow(row2);
 
-        globalLock.EnterReadLock();
+        globalLock.EnterReadLock(); //accessing global read lock
         try
         {
             for (int c = 0; c < cols; c++)
@@ -207,39 +207,39 @@ class SharableSpreadSheet
                 int i1 = row1 * cols + c;
                 int i2 = row2 * cols + c;
 
-                // Enforce consistent lock order to avoid deadlock
+                // ensuring consistent lock order to avoid deadlock
                 if (i1 > i2)
                 {
                     (i1, i2) = (i2, i1);
                     (row1, row2) = (row2, row1);
                 }
 
-                var lock1 = GetLockForCell(row1, c);
+                var lock1 = GetLockForCell(row1, c); //switching each one by order
                 var lock2 = GetLockForCell(row2, c);
 
-                lock1.EnterWriteLock();
+                lock1.EnterWriteLock(); //accessing a write lock for each cell (not using setcell to not risk deadlocks)
                 lock2.EnterWriteLock();
                 try
                 {
-                    string temp = data[row1, c];
+                    string temp = data[row1, c]; //switching their values
                     data[row1, c] = data[row2, c];
                     data[row2, c] = temp;
                 }
                 finally
                 {
-                    lock2.ExitWriteLock();
+                    lock2.ExitWriteLock(); //releasing local writing lock
                     lock1.ExitWriteLock();
                 }
             }
         }
         finally
         {
-            globalLock.ExitReadLock();
+            globalLock.ExitReadLock(); //releasing global reading lock
         }
     }
 
-    // Column exchange works similarly to row exchange
-    public void exchangeCols(int col1, int col2)
+
+    public void exchangeCols(int col1, int col2) //exactly the same as exchangeRows, also a global read and local write operation
     {
         ValidateCol(col1);
         ValidateCol(col2);
@@ -282,92 +282,102 @@ class SharableSpreadSheet
         }
     }
 
-    // Search operations only require read access on both layers
-    public Tuple<int, int> searchString(string str)
+    public Tuple<int, int> searchString(string str) // searching for a string in the entire spreadsheet, this is a global and local read function
     {
-        globalLock.EnterReadLock();
+        globalLock.EnterReadLock(); // accessing the global read lock
         try
         {
-            for (int r = 0; r < rows; r++)
+            Tuple<int, int> result = null;
+
+            for (int r = 0; r < rows && result == null; r++) // iterate through each cell
             {
-                for (int c = 0; c < cols; c++)
+                for (int c = 0; c < cols; c++) 
                 {
                     var cellLock = GetLockForCell(r, c);
-                    cellLock.EnterReadLock();
+                    cellLock.EnterReadLock(); // accessing the cell's read lock
                     try
                     {
-                        if (data[r, c] == str)
-                            return Tuple.Create(r, c);
+                        if (data[r, c].Equals(str)) // checking if the string matches
+                        {
+
+                            cellLock.ExitReadLock(); //releasing cell lock
+                            globalLock.ExitReadLock(); // always release global lock
+                            return Tuple.Create(r, c);// breaking the inner loop cause we found the correct one, this is potentially causing a race condition but its better than leaving the locks locked
+
+                        }
                     }
                     finally
                     {
-                        cellLock.ExitReadLock();
+                        cellLock.ExitReadLock(); //releasing cell lock
                     }
                 }
             }
+
         }
         finally
         {
-            globalLock.ExitReadLock();
+            globalLock.ExitReadLock(); // always release global lock
         }
-        return null;
     }
 
+
     // Save operation acquires global write lock (blocks structure and cell ops)
-    public void save(string filename)
+    public void save(string filename) //the save operation, it requires a global write lock
     {
-        globalLock.EnterWriteLock();
+        globalLock.EnterWriteLock(); //accessing the global write lock
         try
         {
-            using (StreamWriter sw = new StreamWriter(filename))
+            using (StreamWriter sw = new StreamWriter(filename)) //opening the file for writing
             {
-                for (int r = 0; r < rows; r++)
+                for (int r = 0; r < rows; r++) //iterating through each row
                 {
-                    List<string> rowValues = new List<string>();
+                    List<string> rowValues = new List<string>(); //getting the row values and storing in a list
                     for (int c = 0; c < cols; c++)
-                        rowValues.Add(data[r, c] ?? "");
-                    sw.WriteLine(string.Join(",", rowValues));
+                        rowValues.Add(data[r, c] ?? ""); //adding a cell value or empty if null
+                    sw.WriteLine(string.Join(",", rowValues)); // writing row to file, separated by a comma
                 }
             }
         }
         finally
         {
-            globalLock.ExitWriteLock();
+            globalLock.ExitWriteLock(); // releasing the global write lock after saving
         }
     }
 
-    // Load operation acquires global write lock
-    public void load(string filename)
+    public void load(string filename) //load operation, it also requires a global write lock
     {
-        globalLock.EnterWriteLock();
+        globalLock.EnterWriteLock(); //accessing the global write lock
         try
         {
-            var lines = File.ReadAllLines(filename);
-            int newRows = lines.Length;
+            if (!File.Exists(filename))
+                throw new FileNotFoundException($"The file '{filename}' was not found.");
+
+            var lines = File.ReadAllLines(filename); //reading all lines from file
+            int newRows = lines.Length; //getting the number of rows and cols
             int newCols = 0;
 
-            if (newRows > 0)
-                newCols = lines[0].Split(',').Length;
+            newCols = lines[0].Split(',').Length; // getting the number of columns from first line
 
-            var newData = new string[newRows, newCols];
-            for (int r = 0; r < newRows; r++)
+            var newData = new string[newRows, newCols]; // allocating a new data array
+            for (int r = 0; r < newRows; r++) // filling data array from file
             {
                 var parts = lines[r].Split(',');
                 for (int c = 0; c < newCols; c++)
                 {
-                    newData[r, c] = (c < parts.Length) ? parts[c] : "";
+                    newData[r, c] = (c < parts.Length) ? parts[c] : ""; // handling missing values
                 }
             }
 
-            data = newData;
+            data = newData; // updating the spreadsheet object variables
             rows = newRows;
             cols = newCols;
 
-            ResizeLocksIfNeeded();
+            ResizeLocksIfNeeded(); // resizing local locks to match new amount of rows and cols
         }
         finally
         {
-            globalLock.ExitWriteLock();
+            globalLock.ExitWriteLock(); // releasing the global write lock after loading
         }
+
     }
 }
