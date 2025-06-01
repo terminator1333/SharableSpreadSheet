@@ -43,7 +43,7 @@ class SharableSpreadSheet
 
         if (desiredLockCount != userLocks.Length) //resising only if needed
         {
-            
+
             foreach (var l in userLocks)
                 l.Dispose(); //disposing old locks
 
@@ -53,7 +53,7 @@ class SharableSpreadSheet
         }
     }
 
-    
+
     private ReaderWriterLockSlim GetLockForCell(int row, int col) //mapping a cell to a partition lock index
     {
         int index = ((row * cols + col) % userLocks.Length); //using a simple function for mapping a the place of a cell to a lock
@@ -79,29 +79,20 @@ class SharableSpreadSheet
     }
 
 
-    public string getCell(int row, int col) //getting the text of a cell, needs globalLock read and cell lock read
+    public string getCell(int row, int col)
     {
-        ValidateIndices(row, col); //checking if indicies are fine
+        ValidateIndices(row, col);
 
-   
-        globalLock.EnterReadLock(); //preventing writer functions
+        globalLock.EnterReadLock();
+        var cellLock = GetLockForCell(row, col);
+        cellLock.EnterReadLock();
         try
         {
-            var cellLock = GetLockForCell(row, col); //getting the partitioned local lock
-            cellLock.EnterReadLock();
-            try
-            {
-                cellLock.ExitReadLock(); //exiting global and local locks
-                globalLock.ExitReadLock();
-                return data[row, col]; //returning the text
-            }
-            finally
-            {
-                cellLock.ExitReadLock(); //exiting global and local locks
-            }
+            return data[row, col];
         }
         finally
         {
+            cellLock.ExitReadLock();
             globalLock.ExitReadLock();
         }
     }
@@ -121,7 +112,7 @@ class SharableSpreadSheet
                 data[row, col] = str; //chaning the value
             }
             finally
-            { 
+            {
                 cellLock.ExitWriteLock(); //exiting local write lock
             }
         }
@@ -140,7 +131,7 @@ class SharableSpreadSheet
         globalLock.EnterWriteLock(); //accessing the global write lock
         try
         {
-        
+
             string[,] newData = new string[rows + 1, cols]; //creating new data array with one more row
 
             for (int r = 0; r <= row1; r++) //all rows up to row1 stay the exact same so we just copy them
@@ -152,7 +143,7 @@ class SharableSpreadSheet
                 for (int c = 0; c < cols; c++)
                     newData[r, c] = (r == row1 + 1) ? "" : data[r - 1, c];
 
-            
+
             data = newData; //replacing the old data and increasing the number of rows
             rows++;
 
@@ -282,43 +273,36 @@ class SharableSpreadSheet
         }
     }
 
-    public Tuple<int, int> searchString(string str) // searching for a string in the entire spreadsheet, this is a global and local read function
+    public Tuple<int, int> searchString(string str)
     {
-        globalLock.EnterReadLock(); // accessing the global read lock
+        globalLock.EnterReadLock();
         try
         {
-            Tuple<int, int> result = null;
-
-            for (int r = 0; r < rows && result == null; r++) // iterate through each cell
+            for (int r = 0; r < rows; r++)
             {
-                for (int c = 0; c < cols; c++) 
+                for (int c = 0; c < cols; c++)
                 {
                     var cellLock = GetLockForCell(r, c);
-                    cellLock.EnterReadLock(); // accessing the cell's read lock
+                    cellLock.EnterReadLock();
                     try
                     {
-                        if (data[r, c].Equals(str)) // checking if the string matches
-                        {
-
-                            cellLock.ExitReadLock(); //releasing cell lock
-                            globalLock.ExitReadLock(); // always release global lock
-                            return Tuple.Create(r, c);// breaking the inner loop cause we found the correct one, this is potentially causing a race condition but its better than leaving the locks locked
-
-                        }
+                        if (data[r, c] == str)
+                            return Tuple.Create(r, c);   // **no early‐unlock**
                     }
                     finally
                     {
-                        cellLock.ExitReadLock(); //releasing cell lock
+                        cellLock.ExitReadLock();
                     }
                 }
             }
-
+            return null;                                  // ← missing in your code
         }
         finally
         {
-            globalLock.ExitReadLock(); // always release global lock
+            globalLock.ExitReadLock();
         }
     }
+
 
 
     // Save operation acquires global write lock (blocks structure and cell ops)
